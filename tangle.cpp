@@ -216,6 +216,18 @@ struct Options {
     int  first_index   = 1;
 };
 
+// Library-side overrides for FEMM meshing. A zero/false value leaves the value
+// derived from the input problem unchanged. Defined in tangle_mesh.h as well;
+// tangle.cpp does not include that header, so keep the two definitions in sync.
+struct MeshOptions {
+    double minimumAngleDegrees = 0.0;      // 0 = use problem [MinAngle]
+    double maximumElementArea = 0.0;       // >0 = apply to every region
+    bool   forceMaximumElementArea = false; // true = override larger region limits
+    bool   suppressExteriorSteinerPoints = false;
+    bool   suppressUnusedVertices = false;
+    bool   verbose = false;
+};
+
 // ============================================================
 // Geometry primitives
 // ============================================================
@@ -405,6 +417,20 @@ struct AGEDef {
     std::vector<int> outerNodes; // ordered by angle
 };
 
+// Ordered correspondence between two matched boundary chains, independent of
+// any periodic field semantics. nodes_a[i] and nodes_b[i] are the final mesh
+// nodes that refinement kept in one-to-one correspondence; marker_a/marker_b
+// record which source boundary each chain came from. This is emitted whenever
+// a PBC declaration pairs two chains, whether or not the caller wants the
+// periodic node pairs that make up pbc_pairs.
+struct BoundaryChainMatch {
+    int marker_a;
+    int marker_b;
+    int type; // 0=periodic, 1=anti-periodic
+    std::vector<int> nodes_a;
+    std::vector<int> nodes_b;
+};
+
 struct Mesh {
     std::vector<Point>    vertices;
     std::vector<Triangle> triangles;
@@ -418,6 +444,7 @@ struct Mesh {
     std::map<int,int> pbc_node_type;     // node→PBC type (0=periodic, 1=anti-periodic)
     std::vector<PBCDef> pbc_defs;        // PBC declarations (cross-marker .poly form)
     std::vector<AGEDef> age_defs;        // air gap element definitions
+    std::vector<BoundaryChainMatch> boundary_matches; // ordered matched chains
 
     void rebuildAdjacency(){
         int nt=(int)triangles.size();
@@ -2970,6 +2997,117 @@ void buildPbcTwinFromCDT(Mesh& mesh){
     }
 }
 
+// Build an ordered node chain from a set of segments by connectivity. The
+// chain runs from one degree-1 endpoint to the other. Closed loops and
+// branching groups (no degree-1 endpoint) return an empty chain.
+static std::vector<int> buildUndirectedChain(
+        const Mesh& mesh, const std::vector<int>& segIndices)
+{
+    if(segIndices.empty()) return {};
+    std::map<int,std::vector<int>> adjacency;
+    for(int si:segIndices){
+        int v0=mesh.segments[si].v0, v1=mesh.segments[si].v1;
+        adjacency[v0].push_back(v1);
+        adjacency[v1].push_back(v0);
+    }
+    int start=-1;
+    for(auto& [node,neighbours]:adjacency)
+        if(neighbours.size()==1){ start=node; break; }
+    if(start<0) return {};
+
+    std::vector<int> chain; chain.push_back(start);
+    std::set<int> visited; visited.insert(start);
+    int current=start;
+    while(true){
+        int next=-1;
+        for(int candidate:adjacency[current])
+            if(!visited.count(candidate)){ next=candidate; break; }
+        if(next<0) break;
+        chain.push_back(next);
+        visited.insert(next);
+        current=next;
+    }
+    return chain;
+}
+
+// Extract the ordered one-to-one correspondence between each declared pair of
+// matched boundary chains. This runs after refinement so the chains reflect the
+// final, synchronously split discretisation, and uses the maintained pbc_twin
+// map to orient chain B relative to chain A. It does not create or depend on
+// any periodic field constraint.
+static void extractBoundaryMatches(Mesh& mesh)
+{
+    mesh.boundary_matches.clear();
+    bool hasPbc=false;
+    for(auto& s:mesh.segments) if(s.pbc_type>=0){ hasPbc=true; break; }
+    if(!hasPbc) return;
+
+    auto appendMatch=[&](int markerA, int markerB, int type,
+                         std::vector<int> chainA, std::vector<int> chainB){
+        if(chainA.empty() || chainB.empty() || chainA.size()!=chainB.size()) return;
+        bool reverse=true, constrained=false;
+        for(size_t i=0;i<chainA.size() && !constrained;i++){
+            auto twin=mesh.pbc_twin.find(chainA[i]);
+            if(twin==mesh.pbc_twin.end()) continue;
+            for(size_t j=0;j<chainB.size();j++){
+                if(chainB[j]==twin->second){
+                    reverse=(j!=i);
+                    constrained=true;
+                    break;
+                }
+            }
+        }
+        if(reverse) std::reverse(chainB.begin(), chainB.end());
+        BoundaryChainMatch match;
+        match.marker_a=markerA;
+        match.marker_b=markerB;
+        match.type=type;
+        match.nodes_a=std::move(chainA);
+        match.nodes_b=std::move(chainB);
+        mesh.boundary_matches.push_back(std::move(match));
+    };
+
+    // Same-marker declarations (FEMM-style): one group holds both sides,
+    // partitioned by the reader-assigned declared side.
+    std::set<int> crossMarkers;
+    for(auto& d:mesh.pbc_defs)
+        if(d.marker_a!=d.marker_b){
+            crossMarkers.insert(d.marker_a);
+            crossMarkers.insert(d.marker_b);
+        }
+    std::set<std::pair<int,int>> groups;
+    for(auto& s:mesh.segments)
+        if(s.pbc_type>=0) groups.insert({s.marker,s.pbc_type});
+    for(auto [marker,type]:groups){
+        if(crossMarkers.count(marker)) continue;
+        std::vector<int> sideA, sideB;
+        for(int si=0;si<(int)mesh.segments.size();si++){
+            auto& s=mesh.segments[si];
+            if(s.marker!=marker || s.pbc_type!=type) continue;
+            if(s.pbc_side==0) sideA.push_back(si);
+            else if(s.pbc_side==1) sideB.push_back(si);
+        }
+        appendMatch(marker, marker, type,
+                    buildUndirectedChain(mesh, sideA),
+                    buildUndirectedChain(mesh, sideB));
+    }
+
+    // Cross-marker declarations: one chain per declared marker.
+    for(auto& d:mesh.pbc_defs){
+        if(d.marker_a==d.marker_b) continue;
+        std::vector<int> sideA, sideB;
+        for(int si=0;si<(int)mesh.segments.size();si++){
+            auto& s=mesh.segments[si];
+            if(s.pbc_type!=d.type) continue;
+            if(s.marker==d.marker_a) sideA.push_back(si);
+            else if(s.marker==d.marker_b) sideB.push_back(si);
+        }
+        appendMatch(d.marker_a, d.marker_b, d.type,
+                    buildUndirectedChain(mesh, sideA),
+                    buildUndirectedChain(mesh, sideB));
+    }
+}
+
 // ============================================================
 // Edge extraction
 // ============================================================
@@ -4889,6 +5027,11 @@ static int runMeshPipeline(Mesh& mesh, const Options& opts)
         }
     }
 
+    // 7b. Ordered matched-chain correspondence, independent of pbc_pairs.
+    // Extracted here (after refinement, before node remapping) so the twin map
+    // still uses the same indices as the segments.
+    extractBoundaryMatches(mesh);
+
     // 8. Jettison unused vertices
     if(opts.jettison){
         std::vector<bool> used(mesh.vertices.size(),false);
@@ -4902,6 +5045,10 @@ static int runMeshPipeline(Mesh& mesh, const Options& opts)
         for(auto& e:mesh.edges){e.first=vremap[e.first];e.second=vremap[e.second];}
         for(auto& s:mesh.segments){s.v0=vremap[s.v0];s.v1=vremap[s.v1];}
         for(auto& p:mesh.pbc_pairs){p.node_a=vremap[p.node_a];p.node_b=vremap[p.node_b];}
+        for(auto& m:mesh.boundary_matches){
+            for(auto& nd:m.nodes_a) nd=vremap[nd];
+            for(auto& nd:m.nodes_b) nd=vremap[nd];
+        }
     }
 
     // 9. Reverse Cuthill-McKee reordering + element sort by region
@@ -4994,6 +5141,10 @@ static int runMeshPipeline(Mesh& mesh, const Options& opts)
         for(auto& e:mesh.edges){ e.first=newnum[e.first]; e.second=newnum[e.second]; }
         for(auto& s:mesh.segments){ s.v0=newnum[s.v0]; s.v1=newnum[s.v1]; }
         for(auto& p:mesh.pbc_pairs){ p.node_a=newnum[p.node_a]; p.node_b=newnum[p.node_b]; }
+        for(auto& m:mesh.boundary_matches){
+            for(auto& nd:m.nodes_a) nd=newnum[nd];
+            for(auto& nd:m.nodes_b) nd=newnum[nd];
+        }
         for(auto& age:mesh.age_defs){
             for(auto& nd:age.innerNodes) nd=newnum[nd];
             for(auto& nd:age.outerNodes) nd=newnum[nd];
@@ -5246,14 +5397,16 @@ int main(int argc, char* argv[]){
 // Library API: mesh a .fem file and return the Mesh in memory
 // ============================================================
 
-int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh)
+// Resolve a bare base name or full FEMM path to an existing file. Returns an
+// empty string when no FEMM file can be found. Honor a full FEMM filename if
+// the caller passed one — don't strip-and-reguess, which silently meshes the
+// .fem when .fee/.feh/.fec was meant. For a bare base, probe for an existing
+// FEMM file, .fem first (an attribute query, not an open: a lock-held file
+// still exists and must resolve normally).
+static std::string resolveFemPath(const std::string& inputBase)
 {
     std::string inputFile = inputBase;
     std::string ext;
-
-    // Honor a full FEMM filename if the caller passed one — don't strip-and-
-    // reguess, which silently meshes the .fem when .fee/.feh/.fec was meant.
-    // (main() already does this; tangle_mesh_fem was the one place that didn't.)
     for(auto tryExt : {".fem", ".fee", ".feh", ".fec"}){
         std::string suf(tryExt);
         if(inputFile.size()>=suf.size() &&
@@ -5262,15 +5415,20 @@ int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh)
         }
     }
     if(ext.empty()){
-        // Bare base (the usual caller): probe for an existing FEMM file, .fem
-        // first. Attribute query, not an open — see the resolution probes in
-        // main(): a lock-held file still exists and must resolve normally.
         for(auto tryExt : {".fem", ".fee", ".feh", ".fec"}){
             if(fileExists(inputFile + tryExt)){ ext = tryExt; inputFile += ext; break; }
         }
     }
-    if(ext.empty()){
+    return ext.empty() ? std::string() : inputFile;
+}
+
+int tangle_mesh_fem(const std::string& inputBase, const MeshOptions& options,
+                    Mesh& outMesh)
+{
+    const std::string inputFile = resolveFemPath(inputBase);
+    if(inputFile.empty()){
         std::cerr << "Could not find .fem file for: " << inputBase << "\n";
+        outMesh = Mesh{};
         return TANGLE_ERR_NO_FILE;
     }
 
@@ -5281,7 +5439,33 @@ int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh)
                     mesh.regions, opts, mesh.age_defs))
         return TANGLE_ERR_PARSE;
 
-    opts.quiet = true;  // suppress meshing diagnostics when called as library
+    // Apply caller overrides on top of the problem-derived defaults. A zero or
+    // false value leaves the problem-derived default in place.
+    if(options.minimumAngleDegrees>0.0){
+        double requested=options.minimumAngleDegrees;
+        if(requested>MINANGLE_MAX_VAL){
+            std::cerr<<"Warning: requested minimum angle "<<requested
+                     <<" deg exceeds the "<<MINANGLE_MAX_VAL
+                     <<" deg termination limit; clamping to "<<MINANGLE_MAX_VAL<<".\n";
+            requested=MINANGLE_MAX_VAL;
+        }
+        opts.min_angle=requested;
+        opts.quality=true;
+    }
+    if(options.maximumElementArea>0.0){
+        for(auto& r:mesh.regions){
+            if(options.forceMaximumElementArea || r.max_area<=0.0 ||
+               r.max_area>options.maximumElementArea)
+                r.max_area=options.maximumElementArea;
+        }
+        opts.area_limit=true;
+    }
+    if(options.suppressExteriorSteinerPoints) opts.no_steiner=true;
+    // FEMM inputs already jettison unused vertices by default (the reader sets
+    // opts.jettison); the option can only request it, never disable it, so the
+    // established FEMM output is preserved.
+    if(options.suppressUnusedVertices) opts.jettison=true;
+    opts.quiet=!options.verbose;
 
     if(!opts.quiet){
         std::cerr<<"Input: "<<mesh.vertices.size()<<" vertices";
@@ -5294,4 +5478,9 @@ int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh)
 
     outMesh = std::move(mesh);
     return TANGLE_OK;
+}
+
+int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh)
+{
+    return tangle_mesh_fem(inputBase, MeshOptions{}, outMesh);
 }

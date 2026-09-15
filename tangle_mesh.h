@@ -68,6 +68,20 @@ struct AGEDef {
     std::vector<int> outerNodes;
 };
 
+// Ordered correspondence between two matched boundary chains, independent of
+// any periodic field semantics. nodes_a[i] and nodes_b[i] are the final mesh
+// nodes that refinement kept in one-to-one correspondence; marker_a/marker_b
+// record which source boundary each chain came from. This is emitted whenever
+// a PBC declaration pairs two chains, whether or not the caller wants the
+// periodic node pairs that make up pbc_pairs.
+struct BoundaryChainMatch {
+    int marker_a;
+    int marker_b;
+    int type; // 0=periodic, 1=anti-periodic
+    std::vector<int> nodes_a;
+    std::vector<int> nodes_b;
+};
+
 struct Mesh {
     std::vector<Point>    vertices;
     std::vector<Triangle> triangles;
@@ -81,6 +95,7 @@ struct Mesh {
     std::map<int,int> pbc_node_type;
     std::vector<PBCDef> pbc_defs;
     std::vector<AGEDef> age_defs;
+    std::vector<BoundaryChainMatch> boundary_matches; // ordered matched chains
 
     void rebuildAdjacency();
     int locateTriangle(double px, double py, int hint = 0) const;
@@ -100,8 +115,23 @@ enum TangleStatus {
     TANGLE_ERR_OPTION  = 5,  // option not valid for this input (e.g. -g on a non-FEMM file)
 };
 
+// Optional library-side overrides for FEMM meshing. A zero/false value leaves
+// the value derived from the input problem unchanged.
+struct MeshOptions {
+    double minimumAngleDegrees = 0.0;       // 0 = use the problem's [MinAngle]
+    double maximumElementArea = 0.0;        // >0 = apply to every region
+    bool   forceMaximumElementArea = false; // true = override larger region limits
+    bool   suppressExteriorSteinerPoints = false;
+    bool   suppressUnusedVertices = false;
+    bool   verbose = false;
+};
+
 // Mesh a .fem file in-memory. Returns TANGLE_OK (0) on success, else one of the
 // TANGLE_ERR_* codes above (tangle_mesh_fem yields NO_FILE / PARSE / MESH).
+// The MeshOptions overload applies the caller overrides before meshing; the
+// no-options overload uses the problem-derived defaults.
 int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh);
+int tangle_mesh_fem(const std::string& inputBase, const MeshOptions& options,
+                    Mesh& outMesh);
 
 #endif
