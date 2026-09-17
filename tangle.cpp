@@ -228,6 +228,59 @@ struct MeshOptions {
     bool   verbose = false;
 };
 
+// In-memory FEMM-like problem description accepted by the additive library
+// entry point tangle_mesh_fem(const FemProblem&, ...). Field conventions match
+// the .fem file columns: boundary and circuit references are 1-based, and 0
+// means "none". Keep in sync with the copy in tangle_mesh.h.
+struct FemProblem {
+    bool   isMagnetics = true;  // .fem magnetics numbering (4/5/6/7 BdryFormat)
+    double minAngle = 20.0;
+    bool   doSmartMesh = false;
+
+    struct Node {
+        double x = 0.0, y = 0.0;
+        int boundaryMarker = 0;  // 1-based; 0 = none
+        int group = 0;
+    };
+    struct Segment {
+        int n0 = 0, n1 = 0;
+        double maxSideLength = 0.0;
+        int boundaryMarker = 0;  // 1-based; 0 = none
+        int hidden = 0;
+        int group = 0;
+    };
+    struct Arc {
+        int n0 = 0, n1 = 0;
+        double arcLength = 0.0;
+        double maxSegDegrees = 0.0;
+        int boundaryMarker = 0;  // 1-based; 0 = none
+        int hidden = 0;
+        int group = 0;
+    };
+    struct Label {
+        double x = 0.0, y = 0.0;
+        int blockType = 0;          // 1-based; 0 = <None>
+        double maxAreaDiameter = -1.0; // .fem mesh-size column (diameter); <=0 = none
+        int inCircuit = 0;          // 1-based; 0 = none
+        double magDir = 0.0;
+        int group = 0;
+        int turns = 1;
+        int isExternal = 0;
+    };
+    struct Boundary {
+        std::string name;
+        int format = 0;             // 4/5 periodic/antiperiodic, 6/7 AGE
+        double innerAngle = 0.0;
+        double outerAngle = 0.0;
+    };
+
+    std::vector<Node> nodes;
+    std::vector<Segment> segments;
+    std::vector<Arc> arcs;
+    std::vector<Label> labels;
+    std::vector<Boundary> boundaries;
+};
+
 // ============================================================
 // Geometry primitives
 // ============================================================
@@ -3477,27 +3530,15 @@ static int parseNums(const std::string& line, double* out, int maxN){
     return n;
 }
 
-bool readFemFile(const std::string& filename,
-                 std::vector<Point>& pts,
-                 std::vector<Segment>& segs,
-                 std::vector<Hole>& holes,
-                 std::vector<Region>& regions,
-                 Options& opts,
-                 std::vector<AGEDef>& ageDefs)
+bool readFemStream(std::istream& f, bool isMagnetics,
+                   std::vector<Point>& pts,
+                   std::vector<Segment>& segs,
+                   std::vector<Hole>& holes,
+                   std::vector<Region>& regions,
+                   Options& opts,
+                   std::vector<AGEDef>& ageDefs)
 {
-    std::ifstream f;
-    if(!openWithRetry(f, filename, std::ios::in, true)){
-        std::cerr<<"Cannot open "<<filename<<"\n";return false;}
-
-    // Detect file type from extension
-    bool hasConductors = false;  // .fee, .feh, .fec have conductor columns
-    bool isMagnetics = true;     // .fem uses different BdryFormat numbering
-    { auto dot = filename.rfind('.');
-      if(dot!=std::string::npos){
-          std::string ext=filename.substr(dot);
-          if(ext==".fee"||ext==".feh"||ext==".fec") { hasConductors=true; isMagnetics=false; }
-      }
-    }
+    const bool hasConductors = !isMagnetics; // .fee, .feh, .fec have conductor columns
     // BdryFormat for periodic/anti-periodic differs by physics type:
     //   Magnetics (.fem): 4=periodic, 5=anti-periodic, 6=periodic AGE, 7=anti-periodic AGE
     //   Others (.fee/.feh/.fec): 3=periodic, 4=anti-periodic (no AGE)
@@ -4154,6 +4195,30 @@ bool readFemFile(const std::string& filename,
     opts.no_lfs_output=true; // FEMM solver doesn't understand LFS column
 
     return true;
+}
+
+// Thin file wrapper around readFemStream: open the file, detect the physics
+// type from the extension, and parse. The in-memory entry point
+// tangle_mesh_fem(const FemProblem&, ...) calls readFemStream directly.
+bool readFemFile(const std::string& filename,
+                 std::vector<Point>& pts,
+                 std::vector<Segment>& segs,
+                 std::vector<Hole>& holes,
+                 std::vector<Region>& regions,
+                 Options& opts,
+                 std::vector<AGEDef>& ageDefs)
+{
+    std::ifstream f;
+    if(!openWithRetry(f, filename, std::ios::in, true)){
+        std::cerr<<"Cannot open "<<filename<<"\n";return false;}
+    bool isMagnetics = true; // .fem uses magnetics BdryFormat numbering
+    { auto dot = filename.rfind('.');
+      if(dot!=std::string::npos){
+          std::string ext=filename.substr(dot);
+          if(ext==".fee"||ext==".feh"||ext==".fec") isMagnetics=false;
+      }
+    }
+    return readFemStream(f, isMagnetics, pts, segs, holes, regions, opts, ageDefs);
 }
 
 // Fast formatting helpers for the large output files.  ostream operator<<
@@ -5422,25 +5487,12 @@ static std::string resolveFemPath(const std::string& inputBase)
     return ext.empty() ? std::string() : inputFile;
 }
 
-int tangle_mesh_fem(const std::string& inputBase, const MeshOptions& options,
-                    Mesh& outMesh)
+namespace {
+
+// Apply caller overrides on top of the problem-derived defaults. A zero or
+// false value leaves the problem-derived default in place.
+void applyMeshOptions(Options& opts, Mesh& mesh, const MeshOptions& options)
 {
-    const std::string inputFile = resolveFemPath(inputBase);
-    if(inputFile.empty()){
-        std::cerr << "Could not find .fem file for: " << inputBase << "\n";
-        outMesh = Mesh{};
-        return TANGLE_ERR_NO_FILE;
-    }
-
-    Options opts;
-    Mesh mesh;
-
-    if(!readFemFile(inputFile, mesh.vertices, mesh.segments, mesh.holes,
-                    mesh.regions, opts, mesh.age_defs))
-        return TANGLE_ERR_PARSE;
-
-    // Apply caller overrides on top of the problem-derived defaults. A zero or
-    // false value leaves the problem-derived default in place.
     if(options.minimumAngleDegrees>0.0){
         double requested=options.minimumAngleDegrees;
         if(requested>MINANGLE_MAX_VAL){
@@ -5466,6 +5518,28 @@ int tangle_mesh_fem(const std::string& inputBase, const MeshOptions& options,
     // established FEMM output is preserved.
     if(options.suppressUnusedVertices) opts.jettison=true;
     opts.quiet=!options.verbose;
+}
+
+} // namespace
+
+int tangle_mesh_fem(const std::string& inputBase, const MeshOptions& options,
+                    Mesh& outMesh)
+{
+    const std::string inputFile = resolveFemPath(inputBase);
+    if(inputFile.empty()){
+        std::cerr << "Could not find .fem file for: " << inputBase << "\n";
+        outMesh = Mesh{};
+        return TANGLE_ERR_NO_FILE;
+    }
+
+    Options opts;
+    Mesh mesh;
+
+    if(!readFemFile(inputFile, mesh.vertices, mesh.segments, mesh.holes,
+                    mesh.regions, opts, mesh.age_defs))
+        return TANGLE_ERR_PARSE;
+
+    applyMeshOptions(opts, mesh, options);
 
     if(!opts.quiet){
         std::cerr<<"Input: "<<mesh.vertices.size()<<" vertices";
@@ -5473,6 +5547,68 @@ int tangle_mesh_fem(const std::string& inputBase, const MeshOptions& options,
         if(!mesh.regions.empty()) std::cerr<<", "<<mesh.regions.size()<<" regions";
         std::cerr<<"\n";
     }
+
+    if(int rc=runMeshPipeline(mesh, opts)) return rc;
+
+    outMesh = std::move(mesh);
+    return TANGLE_OK;
+}
+
+// Serialize a FEMM-like record set into the .fem text the reader consumes.
+// This is an internal bridge so the in-memory entry point shares the exact
+// file parser (arc discretization, LFS, PBC and AGE handling) with no file
+// I/O. Fields follow the .fem columns.
+static void writeFemStream(const FemProblem& problem, std::ostream& out)
+{
+    out << "[Format] = 4.0\n";
+    out << "[MinAngle] = " << problem.minAngle << "\n";
+    out << "[dosmartmesh] = " << (problem.doSmartMesh ? 1 : 0) << "\n";
+    out << "[BdryProps] = " << problem.boundaries.size() << "\n";
+    for(const auto& b : problem.boundaries){
+        out << "  <BeginBdry>\n";
+        out << "    <BdryName> = \"" << b.name << "\"\n";
+        out << "    <BdryType> = " << b.format << "\n";
+        out << "    <innerangle> = " << b.innerAngle << "\n";
+        out << "    <outerangle> = " << b.outerAngle << "\n";
+        out << "  <EndBdry>\n";
+    }
+    out << "[PointProps] = 0\n";
+    out << "[BlockProps] = 0\n";
+    out << "[CircuitProps] = 0\n";
+    out << "[NumPoints] = " << problem.nodes.size() << "\n";
+    for(const auto& n : problem.nodes)
+        out << n.x << "\t" << n.y << "\t" << n.boundaryMarker << "\t" << n.group << "\n";
+    out << "[NumSegments] = " << problem.segments.size() << "\n";
+    for(const auto& s : problem.segments)
+        out << s.n0 << "\t" << s.n1 << "\t" << s.maxSideLength << "\t"
+            << s.boundaryMarker << "\t" << s.hidden << "\t" << s.group << "\n";
+    out << "[NumArcSegments] = " << problem.arcs.size() << "\n";
+    for(const auto& a : problem.arcs)
+        out << a.n0 << "\t" << a.n1 << "\t" << a.arcLength << "\t"
+            << a.maxSegDegrees << "\t" << a.boundaryMarker << "\t" << a.hidden
+            << "\t" << a.group << "\n";
+    out << "[NumHoles] = 0\n";
+    out << "[NumBlockLabels] = " << problem.labels.size() << "\n";
+    for(const auto& l : problem.labels)
+        out << l.x << "\t" << l.y << "\t" << l.blockType << "\t"
+            << l.maxAreaDiameter << "\t" << l.inCircuit << "\t" << l.magDir << "\t"
+            << l.group << "\t" << l.turns << "\t" << l.isExternal << "\n";
+}
+
+int tangle_mesh_fem(const FemProblem& problem, const MeshOptions& options,
+                    Mesh& outMesh)
+{
+    std::ostringstream buffer;
+    writeFemStream(problem, buffer);
+    std::istringstream input(buffer.str());
+
+    Options opts;
+    Mesh mesh;
+    if(!readFemStream(input, problem.isMagnetics, mesh.vertices, mesh.segments,
+                      mesh.holes, mesh.regions, opts, mesh.age_defs))
+        return TANGLE_ERR_PARSE;
+
+    applyMeshOptions(opts, mesh, options);
 
     if(int rc=runMeshPipeline(mesh, opts)) return rc;
 

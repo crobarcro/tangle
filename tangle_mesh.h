@@ -126,12 +126,71 @@ struct MeshOptions {
     bool   verbose = false;
 };
 
+// In-memory FEMM-like problem description accepted by the record-based library
+// entry point. Field conventions match the .fem file columns: boundary and
+// circuit references are 1-based, and 0 means "none". This lets a caller mesh
+// a problem it has already parsed without a file round trip, while sharing the
+// exact file reader (arc discretization, LFS, PBC and AGE handling).
+struct FemProblem {
+    bool   isMagnetics = true;  // .fem magnetics numbering (4/5/6/7 BdryFormat)
+    double minAngle = 20.0;
+    bool   doSmartMesh = false;
+
+    struct Node {
+        double x = 0.0, y = 0.0;
+        int boundaryMarker = 0;  // 1-based; 0 = none
+        int group = 0;
+    };
+    struct Segment {
+        int n0 = 0, n1 = 0;
+        double maxSideLength = 0.0;
+        int boundaryMarker = 0;  // 1-based; 0 = none
+        int hidden = 0;
+        int group = 0;
+    };
+    struct Arc {
+        int n0 = 0, n1 = 0;
+        double arcLength = 0.0;
+        double maxSegDegrees = 0.0;
+        int boundaryMarker = 0;  // 1-based; 0 = none
+        int hidden = 0;
+        int group = 0;
+    };
+    struct Label {
+        double x = 0.0, y = 0.0;
+        int blockType = 0;             // 1-based; 0 = <None>
+        double maxAreaDiameter = -1.0; // .fem mesh-size column (diameter); <=0 = none
+        int inCircuit = 0;             // 1-based; 0 = none
+        double magDir = 0.0;
+        int group = 0;
+        int turns = 1;
+        int isExternal = 0;
+    };
+    struct Boundary {
+        std::string name;
+        int format = 0;                // 4/5 periodic/antiperiodic, 6/7 AGE
+        double innerAngle = 0.0;
+        double outerAngle = 0.0;
+    };
+
+    std::vector<Node> nodes;
+    std::vector<Segment> segments;
+    std::vector<Arc> arcs;
+    std::vector<Label> labels;
+    std::vector<Boundary> boundaries;
+};
+
 // Mesh a .fem file in-memory. Returns TANGLE_OK (0) on success, else one of the
 // TANGLE_ERR_* codes above (tangle_mesh_fem yields NO_FILE / PARSE / MESH).
 // The MeshOptions overload applies the caller overrides before meshing; the
 // no-options overload uses the problem-derived defaults.
 int tangle_mesh_fem(const std::string& inputBase, Mesh& outMesh);
 int tangle_mesh_fem(const std::string& inputBase, const MeshOptions& options,
+                    Mesh& outMesh);
+
+// Mesh an in-memory FEMM-like problem. Same semantics and status codes as the
+// file overload, but reads no file. Additive: the file overloads are unchanged.
+int tangle_mesh_fem(const FemProblem& problem, const MeshOptions& options,
                     Mesh& outMesh);
 
 #endif
