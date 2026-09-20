@@ -166,6 +166,7 @@ struct FemProblem {
         int turns = 1;
         int isExternal = 0;
     };
+    struct Hole { double x = 0.0, y = 0.0; };
     struct Boundary {
         std::string name;
         int format = 0;                // 4/5 periodic/antiperiodic, 6/7 AGE
@@ -178,6 +179,7 @@ struct FemProblem {
     std::vector<Arc> arcs;
     std::vector<Label> labels;
     std::vector<Boundary> boundaries;
+    std::vector<Hole> holes;
 };
 
 // Mesh a .fem file in-memory. Returns TANGLE_OK (0) on success, else one of the

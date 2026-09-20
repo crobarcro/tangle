@@ -267,6 +267,7 @@ struct FemProblem {
         int turns = 1;
         int isExternal = 0;
     };
+    struct Hole { double x = 0.0, y = 0.0; };
     struct Boundary {
         std::string name;
         int format = 0;             // 4/5 periodic/antiperiodic, 6/7 AGE
@@ -279,6 +280,7 @@ struct FemProblem {
     std::vector<Arc> arcs;
     std::vector<Label> labels;
     std::vector<Boundary> boundaries;
+    std::vector<Hole> holes;
 };
 
 // ============================================================
@@ -5587,7 +5589,9 @@ static void writeFemStream(const FemProblem& problem, std::ostream& out)
         out << a.n0 << "\t" << a.n1 << "\t" << a.arcLength << "\t"
             << a.maxSegDegrees << "\t" << a.boundaryMarker << "\t" << a.hidden
             << "\t" << a.group << "\n";
-    out << "[NumHoles] = 0\n";
+    out << "[NumHoles] = " << problem.holes.size() << "\n";
+    for(const auto& h : problem.holes)
+        out << h.x << "\t" << h.y << "\n";
     out << "[NumBlockLabels] = " << problem.labels.size() << "\n";
     for(const auto& l : problem.labels)
         out << l.x << "\t" << l.y << "\t" << l.blockType << "\t"
